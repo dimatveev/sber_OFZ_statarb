@@ -22,8 +22,8 @@ class StrategyConfig:
     # Сигналы
     beta_lookback_min: int = 120  # окно расчёта β (минуты)
     z_lookback_min: int = 240  # окно расчёта статистики z-score (минуты)
-    z_enter: float = 2.0
-    z_exit: float = 0.5
+    z_enter: float = 1.65
+    z_exit: float = 0.4
     # Адаптация к волатильности и рыночным режимам
     vol_lookback_min: int = 240
     vol_target: float = 0.005  # целевая минутная волатильность спреда (0.5%) для масштабирования риска
@@ -51,7 +51,7 @@ class StrategyConfig:
     enter_eff_max: float = 2.75
     # Интрадей-правила
     daily_warmup_minutes: int = 80  # не торгуем первые N минут каждого дня
-    daily_flat_time: Optional[str] = "18:00:00"  # после этого времени не открываем новые, повышаем z_exit_eff
+    daily_flat_time: Optional[str] = "18:12:00"  # после этого времени не открываем новые, повышаем z_exit_eff
     late_flat_time: Optional[str] = "18:40:00"   # к этому времени принудительно в ноль
     post_flat_exit_mult: float = 2.0              # усиление z_exit_eff после daily_flat_time
     block_entries_after_flat_time: bool = True    # после daily_flat_time новые входы запрещены
@@ -384,6 +384,8 @@ def run_backtest(
     z_vals = df["z"].values.astype(float)
     pos_dir_list: list[int] = []
     pos_coef_list: list[float] = []
+    enter_eff_list: list[float] = []
+    exit_eff_list: list[float] = []
     state = 0
     prev_coef = 0.0
     max_c = float(max(0.0, config.max_position_coef))
@@ -400,8 +402,8 @@ def run_backtest(
         if config.enable_dynamic_thresholds and max_c > 0:
             pos_fraction = min(1.0, abs(prev_coef) / max_c)
             enter_thr = z_enter_arr[i] * (1.0 + config.enter_k * pos_fraction)
-            # Клип абсолютного эффективного порога входа в [enter_eff_min, enter_eff_max]
-            enter_thr = float(np.clip(enter_thr, config.enter_eff_min, config.enter_eff_max))
+            # Только нижняя защита порога входа: убираем верхнюю отсечку, чтобы не мешать донабору
+            enter_thr = float(max(config.enter_eff_min, enter_thr))
             exit_thr = z_exit_arr[i] * (1.0 + config.exit_k * pos_fraction)
         else:
             enter_thr = z_enter_arr[i]
@@ -410,6 +412,10 @@ def run_backtest(
         # После daily_flat_time: усиливаем выход, запрещаем новые входы
         if _after_flat[i]:
             exit_thr = exit_thr * float(max(1.0, config.post_flat_exit_mult))
+
+        # Сохранить эффективные пороги для отладки/экспорта
+        enter_eff_list.append(float(enter_thr))
+        exit_eff_list.append(float(exit_thr))
 
         # Обновление направления
         if state == 0:
@@ -454,6 +460,8 @@ def run_backtest(
 
     df["pos_dir"] = pd.Series(pos_dir_list, index=df.index)
     df["pos_coef"] = pd.Series(pos_coef_list, index=df.index)
+    df["z_enter_eff"] = pd.Series(enter_eff_list, index=df.index)
+    df["z_exit_eff"] = pd.Series(exit_eff_list, index=df.index)
 
     # Выключатели торговли по волатильности спреда
     # Рассчитать эффективный порог для выключателя: квантильный или фиксированный
@@ -793,7 +801,7 @@ def save_outputs(df: pd.DataFrame, stats: Dict[str, float], out_dir: str) -> Non
     df.to_csv(out_csv, index=False)
     # Экспорт компактной таблицы сигналов
     base_cols = [
-        "dt", "z", "beta", "pos_dir", "pos_coef", "pos_change", "sber_close", "pnl_price", "pnl_carry", "pnl_commission", "pnl_total", "pnl_cum"
+        "dt", "z", "beta", "z_enter_eff", "z_exit_eff", "pos_dir", "pos_coef", "pos_change", "sber_close", "pnl_price", "pnl_carry", "pnl_commission", "pnl_total", "pnl_cum"
     ]
     opt_cols = []
     if "hedge_close" in df.columns:
@@ -806,7 +814,8 @@ def save_outputs(df: pd.DataFrame, stats: Dict[str, float], out_dir: str) -> Non
     for q in ["hedge_qty", "ofz40_qty", "ofz41_qty"]:
         if q in df.columns:
             qty_cols.append(q)
-    signals_cols = base_cols[:6] + opt_cols + ["sber_close"] + qty_cols + base_cols[7:]
+    # Важно: base_cols[:6] не включает pos_coef (индекс 6), поэтому явно добавляем его
+    signals_cols = base_cols[:6] + ["pos_coef"] + opt_cols + ["sber_close"] + qty_cols + base_cols[7:]
     # Обеспечить уникальность и сохранить порядок
     seen = set()
     ordered = []
