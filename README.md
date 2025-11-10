@@ -16,19 +16,25 @@
 
 ## Динамические пороги входа и выхода
 
+Для читаемости используем обозначения без подчёркиваний в формулах (сопоставление с кодом):
+- $c_t \leftrightarrow$ `pos_coef_t`, $d_t \leftrightarrow$ `pos_dir_t`, $c_{\max} \leftrightarrow$ `max_position_coef`, $c_{\text{base}} \leftrightarrow$ `base_position_coef`
+- $k_e \leftrightarrow$ `enter_k`, $k_x \leftrightarrow$ `exit_k`
+- $G_t \leftrightarrow$ `gross_per_side_t`, $v_t \leftrightarrow$ `vol_scale_t`
+- $S_t \leftrightarrow$ `sber_close_t`, $H_t \leftrightarrow$ `hedge_close_t`
+
 Сначала нормируем текущий размер позиции:
 
 $$
-\text{pos\_fraction}_t \;=\; \min\!\left(1, \frac{\lvert \text{pos\_coef}_{t-1} \rvert}{\text{max\_position\_coef}}\right).
+p_t \;=\; \min\!\left(1, \frac{|c_{t-1}|}{c_{\max}}\right).
 $$
 
 Далее вычисляем эффективные пороги (нижняя защита для входа, верхняя отсечка отключена для облегчения донабора):
 
 $$
-z_{\text{enter}}^{\text{eff}}(t) \;=\; \max\!\bigl(z_{\text{enter}}^{\min},\; z_{\text{enter}} \cdot (1 + \text{enter\_k} \cdot \text{pos\_fraction}_t)\bigr),
+z_{\text{enter}}^{\text{eff}}(t) \;=\; \max\!\bigl(z_{\text{enter}}^{\min},\; z_{\text{enter}} \cdot (1 + k_e \cdot p_t)\bigr),
 $$
 $$
-z_{\text{exit}}^{\text{eff}}(t) \;=\; z_{\text{exit}} \cdot (1 + \text{exit\_k} \cdot \text{pos\_fraction}_t).
+z_{\text{exit}}^{\text{eff}}(t) \;=\; z_{\text{exit}} \cdot (1 + k_x \cdot p_t).
 $$
 
 Где $z_{\text{enter}}^{\min}$ — нижняя граница эффективного порога входа (в коде `enter_eff_min`). Верхняя отсечка намеренно убрана, чтобы не препятствовать донабору при больших $\lvert z_t \rvert$.
@@ -42,12 +48,12 @@ $$
 
 ## Пирамидинг (только донабор внутри позиции)
 
-Внутри активной позиции ($\text{pos\_dir}_t \neq 0$) целевой модуль размера определяется от текущего $\lvert z_t \rvert$. Для линейного режима:
+Внутри активной позиции ($d_t \neq 0$) целевой модуль размера определяется от текущего $\lvert z_t \rvert$. Для линейного режима:
 
 $$
 m_t \;=\; \frac{\lvert z_t \rvert}{z_{\text{enter}}^{\text{eff}}(t)}, 
 \qquad
-\text{desired\_abs}_t \;=\; \min\!\bigl(\text{max\_position\_coef},\; \max(0, \text{base\_position\_coef} \cdot m_t)\bigr).
+\text{desired\_abs}_t \;=\; \min\!\bigl(c_{\max},\; \max(0, c_{\text{base}} \cdot m_t)\bigr).
 $$
 
 Для ступенчатого режима используется лестница \( \{(\text{mult}_k, c_k)\} \) по \( m_t \) (см. `size_steps`).
@@ -57,7 +63,7 @@ $$
 $$
 \text{prev\_abs}_t \;=\; 
 \begin{cases}
-\lvert \text{pos\_coef}_{t-1} \rvert, & \text{если }\operatorname{sign}(\text{pos\_coef}_{t-1}) = \operatorname{sign}(\text{pos\_dir}_t),\\
+\lvert c_{t-1} \rvert, & \text{если } \operatorname{sign}(c_{t-1}) = \operatorname{sign}(d_t),\\
 0, & \text{иначе},
 \end{cases}
 \qquad
@@ -67,25 +73,25 @@ $$
 Итоговый коэффициент размера:
 
 $$
-\text{pos\_coef}_t \;=\; \operatorname{sign}(\text{pos\_dir}_t) \cdot \text{final\_abs}_t.
+c_t \;=\; \operatorname{sign}(d_t) \cdot \text{final\_abs}_t.
 $$
 
-При выходе/халтах/стопах $\text{pos\_coef}_t = 0$.
+При выходе/халтах/стопах $c_t = 0$.
 
 ## Связь с объёмами и лимитами
 
 Рассчитываем валовую нагрузку на каждую ногу с учётом волатильности:
 
 $$
-\text{gross\_per\_side}_t \;=\; 0.5 \cdot \text{gross\_limit\_rub} \cdot \text{vol\_scale}_t,
+G_t \;=\; 0.5 \cdot \text{gross\_limit\_rub} \cdot v_t,
 $$
 
 и переводим в количества:
 
 $$
-\text{sber\_qty}_t \;=\; \frac{\text{gross\_per\_side}_t}{\text{sber\_close}_t} \cdot \text{pos\_coef}_t, 
+\text{sber\_qty}_t \;=\; \frac{G_t}{S_t} \cdot c_t, 
 \qquad
-\text{hedge\_qty}_t \;=\; \frac{\text{gross\_per\_side}_t}{\text{hedge\_close}_t} \cdot (-\text{pos\_coef}_t).
+\text{hedge\_qty}_t \;=\; \frac{G_t}{H_t} \cdot (-c_t).
 $$
 
 Для корзины ОФЗ количества делятся по весам. Знак указывает на противоположность ног (рублёвая нейтральность).
