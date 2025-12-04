@@ -465,38 +465,7 @@ def run_backtest(
 
     # Выключатели торговли по волатильности спреда
     # Рассчитать эффективный порог для выключателя: квантильный или фиксированный
-    eff_threshold = None
-    if config.enable_vol_halt:
-        if config.vol_halt_quantile is not None:
-            try:
-                eff_threshold = float(np.nanquantile(df["spread_vol"].values.astype(float), config.vol_halt_quantile))
-            except Exception:
-                eff_threshold = None
-        if eff_threshold is None and (config.vol_halt_threshold or 0) > 0:
-            eff_threshold = float(config.vol_halt_threshold)
-
-    if config.enable_vol_halt and eff_threshold is not None:
-        if str(config.vol_halt_condition).lower() == "below":
-            halted = (df["spread_vol"] < eff_threshold)
-        else:
-            halted = (df["spread_vol"] > eff_threshold)
-        pos_prev = df["pos_dir"].shift(1)
-        pos_new = df["pos_dir"].copy()
-        if config.vol_halt_mode.lower() == "flat":
-            # Принудительно закрыть позиции в периоды экстремальной волатильности
-            pos_new[halted] = 0
-        else:
-            # Блокировать только входы и перевороты; выходы в ноль разрешены
-            is_entry = (pos_prev.fillna(0) == 0) & (pos_new != 0)
-            is_flip = (pos_prev.fillna(0) != 0) & (pos_new != 0) & (np.sign(pos_prev.fillna(0)) != np.sign(pos_new))
-            freeze = halted & (is_entry | is_flip)
-            pos_new[freeze] = pos_prev[freeze]
-            # Разрешить выходы (pos_new==0), даже если halted
-            # Нет дополнительной обработки — они остаются как есть
-        df["pos_dir"] = pos_new.ffill().fillna(0)
-        # Обнулить коэффициент позиции там, где pos_dir=0
-        df["pos_coef"] = df["pos_coef"] * (df["pos_dir"].abs() > 0).astype(float)
-
+ 
     # Халт на шоковые движения по Сберу
     if config.enable_shock_halt and (config.shock_move_threshold or 0) > 0:
         s_move = df["sber_close"].pct_change(config.shock_window_min).abs().fillna(0.0)
@@ -622,17 +591,26 @@ def run_backtest(
     # Long‑спред (+1): long Сбер, short ОФЗ. Short‑спред (−1): short Сбер, long ОФЗ.
     # Расчёт количества единиц (непрерывно) по каждой ноге
     sber_qty = (gross_per_side / df["sber_close"]) * df["pos_coef"]
-    df["sber_qty"] = sber_qty
+    # Клип по полугроссу: |sber_qty| ≤ (0.5 * gross_limit_rub) / sber_close
+    cap_qty = (0.5 * float(config.gross_limit_rub)) / df["sber_close"].astype(float)
+    df["sber_qty"] = sber_qty.clip(lower=-cap_qty, upper=cap_qty)
     hedge_mode = (config.hedge_mode or "OFZ_SINGLE").upper()
     if hedge_mode == "OFZ_BASKET":
         w40, w41 = config.ofz_weights
         total_w = (w40 + w41) if (w40 + w41) != 0 else 1.0
         w40 /= total_w
         w41 /= total_w
-        df["ofz40_qty"] = (gross_per_side * w40 / df["ofz40_close"]) * (-df["pos_coef"])  # противоположная нога
-        df["ofz41_qty"] = (gross_per_side * w41 / df["ofz41_close"]) * (-df["pos_coef"])  # противоположная нога
+        ofz40_qty = (gross_per_side * w40 / df["ofz40_close"]) * (-df["pos_coef"])  # противоположная нога
+        ofz41_qty = (gross_per_side * w41 / df["ofz41_close"]) * (-df["pos_coef"])  # противоположная нога
+        # Клип по полугроссу пропорционально весам корзины
+        cap40 = (0.5 * float(config.gross_limit_rub) * w40) / df["ofz40_close"].astype(float)
+        cap41 = (0.5 * float(config.gross_limit_rub) * w41) / df["ofz41_close"].astype(float)
+        df["ofz40_qty"] = ofz40_qty.clip(lower=-cap40, upper=cap40)
+        df["ofz41_qty"] = ofz41_qty.clip(lower=-cap41, upper=cap41)
     else:
-        df["hedge_qty"] = (gross_per_side / df["hedge_close"]) * (-df["pos_coef"])  # противоположная нога
+        hedge_qty = (gross_per_side / df["hedge_close"]) * (-df["pos_coef"])  # противоположная нога
+        cap_hedge = (0.5 * float(config.gross_limit_rub)) / df["hedge_close"].astype(float)
+        df["hedge_qty"] = hedge_qty.clip(lower=-cap_hedge, upper=cap_hedge)
 
     # Транзакционные издержки: на изменение абсолютного ноциона по каждой ноге
     commission_rate = config.commission_fraction
@@ -801,7 +779,7 @@ def save_outputs(df: pd.DataFrame, stats: Dict[str, float], out_dir: str) -> Non
     df.to_csv(out_csv, index=False)
     # Экспорт компактной таблицы сигналов
     base_cols = [
-        "dt", "z", "beta", "z_enter_eff", "z_exit_eff", "pos_dir", "pos_coef", "pos_change", "sber_close", "pnl_price", "pnl_carry", "pnl_commission", "pnl_total", "pnl_cum"
+        "dt", "z", "beta", "vol_scale", "z_enter_eff", "z_exit_eff", "pos_dir", "pos_coef", "pos_change", "sber_close", "pnl_price", "pnl_carry", "pnl_commission", "pnl_total", "pnl_cum"
     ]
     opt_cols = []
     if "hedge_close" in df.columns:
@@ -1012,6 +990,9 @@ def main():
     # Февраль
     config = StrategyConfig()
     config.months_filter = (2,)
+    # Включаем ступенчатый добор и задаём явную лестницу
+    #config.sizing_mode = "step"
+    #config.size_steps = ((1.0, 0.6), (1.5, 1.0), (2.0, 1.4), (2.5, 1.8))
     df_feb, stats_feb = run_backtest(sber_path, ofz40_path, config, ofz41_path=ofz41_path, rgbi_path=rgbi_path)
     save_outputs(df_feb, stats_feb, os.path.join(root, "output_feb"))
     print("Backtest FEB completed")
@@ -1021,6 +1002,9 @@ def main():
     # Июль
     config = StrategyConfig()
     config.months_filter = (7,)
+    # Те же настройки для июля
+    #config.sizing_mode = "step"
+    #config.size_steps = ((1.0, 0.6), (1.5, 1.0), (2.0, 1.4), (2.5, 1.8))
     df_jul, stats_jul = run_backtest(sber_path, ofz40_path, config, ofz41_path=ofz41_path, rgbi_path=rgbi_path)
     save_outputs(df_jul, stats_jul, os.path.join(root, "output_jul"))
     print("Backtest JUL completed")
